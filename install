@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------------------------
+# (C)opyright 2026 by Daniel Dietrich - MIT license
+# ------------------------------------------------------------------------------
+
+# -e: abort on any failing command; -u: abort on unset variable references.
+# No pipefail: it is not portable to every POSIX sh, and there is no pipeline.
+set -eu
+
+# This is the installer, not flatmap, so its diagnostics say so and its own
+# failures exit 2 -- there is no command whose status it could propagate.
+log() {
+  echo "[flatmap install] $*" >&2
+}
+
+die() {
+  log "$@"
+  exit 2
+}
+
+usage="Usage: install [--path DIR]    install flatmap into DIR (default: /usr/local/bin)"
+
+prefix="/usr/local/bin"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --path)
+      if [ $# -lt 2 ]; then
+        die "flag '$1' requires a DIR argument
+${usage}"
+      fi
+      prefix="$2"; shift 2 ;;
+    -h|--help) echo "$usage"; exit 0 ;;
+    *) die "unknown argument '$1'
+${usage}" ;;
+  esac
+done
+
+target="${prefix}/flatmap"
+
+[ -d "$prefix" ] || die "no such directory '${prefix}'; hint: pass --path DIR"
+
+# Installing into a directory we do not own is the normal case, so escalate
+# only then, and only if there is something to escalate with.
+sudo=""
+if [ ! -w "$prefix" ]; then
+  command -v sudo > /dev/null || die "'${prefix}' is not writable and sudo is not available"
+  sudo="sudo"
+  log "'${prefix}' is not writable, using sudo"
+fi
+
+# In a checkout the script next door is the one to install. Piped in or run
+# from a process substitution there is no file of our own, hence no sibling,
+# and the published script is the source.
+src=""
+if [ -f "$0" ]; then
+  here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -f "${here}/index.html" ]; then
+    src="${here}/index.html"
+  fi
+fi
+
+if [ -n "$src" ]; then
+  log "installing ${src} as ${target}"
+  $sudo install -m 755 "$src" "$target"
+else
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' EXIT
+
+  # -f so an error page is a failure here instead of an executable later.
+  log "downloading cli.flatmap.ai"
+  curl -fsLo "$tmp" cli.flatmap.ai || die "download failed"
+
+  log "installing ${target}"
+  $sudo install -m 755 "$tmp" "$target"
+fi
+
+# Resolved, not just found: another flatmap earlier on PATH would shadow this
+# one, and saying "done" then would point at the wrong script.
+found="$(command -v flatmap || true)"
+if [ "$found" = "$target" ]; then
+  log "done, run 'flatmap --help'"
+elif [ -n "$found" ]; then
+  log "done, but '${found}' comes first on PATH and shadows '${target}'"
+else
+  log "done, but '${prefix}' is not on PATH; add it, then run 'flatmap --help'"
+fi

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# ------------------------------------------------------------------------------
+# (C)opyright 2026 by Daniel Dietrich - MIT license
+# ------------------------------------------------------------------------------
+
+# <html hidden><script>location.href="page.html"</script></html>
+
+# -e: abort on any failing command; -u: abort on unset variable references.
+set -eu
+
+# All diagnostics go to stderr, prefixed so they are distinguishable.
+log() {
+  echo "[flatmap] $*" >&2
+}
+
+die() {
+  log "$@"
+  exit 2
+}
+
+# FLATMAP_BIN is the path to this script for recursive calls from commands.
+if [ -z "${FLATMAP_BIN:-}" ] && [ -f "$0" ]; then
+  FLATMAP_BIN="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  export FLATMAP_BIN
+fi
+
+usage() {
+  cat <<'USAGE'
+Usage: flatmap [FLAG...] COMMAND [ARG...]
+
+Reads records from stdin, pipes each record to COMMAND as its stdin, and
+writes each COMMAND stdout as one output record, in input order.
+
+Flags:
+  -z, --zero         Records are NUL-separated: split stdin at NUL and
+                     terminate each output record with NUL.
+  -s, --scope SCOPE  Base directory for resolving SCOPE/commands/COMMAND
+                     (default: $FLATMAP_SCOPE, or ./.flatmap).
+  -h, --help         Print this help and exit.
+  --                 End of flags, for a COMMAND starting with '-'.
+
+COMMAND is the executable SCOPE/commands/COMMAND, run directly so its
+own #! line picks the interpreter. ARG... are passed on unparsed, so
+no -- is needed before them.
+
+List available commands: ls "${FLATMAP_SCOPE:-./.flatmap}"/commands
+
+Environment:
+  FLATMAP_SCOPE  Default SCOPE; exported to COMMAND as the scope in use.
+  FLATMAP_BIN    Exported absolute path of this script, so COMMAND can
+                 invoke flatmap recursively without relying on PATH. Unset
+                 if this script has no file of its own (it was piped in
+                 from a process substitution): save it to a file to let
+                 commands recurse.
+
+Exit status:
+  0  all records processed
+  2  usage error: bad flag, missing COMMAND, COMMAND not found or not
+     executable
+  N  COMMAND exited N on a record; flatmap stops there and exits N,
+     leaving earlier records already written to stdout. Whatever the
+     failing record wrote stays on stdout too, unterminated. Codes
+     other than 2 (notably 1) always come from COMMAND.
+
+Examples:
+  cat file.txt | flatmap summarize
+  find . -type f -print0 | flatmap -z lint --strict   # record = pathname
+  flatmap -s ./tools fmt < in.txt > out.txt
+USAGE
+}
+
+# Runs the command script on one record. The record is call_command's own
+# stdin, which COMMAND inherits; $script, $count and $nul are the globals
+# set below, and the arguments are COMMAND's own.
+call_command() {
+  local status=0
+
+  # COMMAND reads our stdin and writes our stdout directly, so the bytes
+  # on both sides are exactly its own: verbatim, unbuffered, binary safe.
+  "$script" "$@" || status=$?
+
+  # The terminator goes after those bytes, so framing needs nothing held
+  # in memory. A failed record is left unterminated -- its partial output
+  # stays on stdout, the same as without -z.
+  if [ "$nul" -eq 1 ] && [ "$status" -eq 0 ]; then
+    printf '\0'
+  fi
+
+  if [ "$status" -ne 0 ]; then
+    log "${script} failed on record ${count} of stdin (exit ${status})"
+    return "$status"
+  fi
+}
+
+nul=0
+scope="${FLATMAP_SCOPE:-$PWD/.flatmap}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -z|--zero) nul=1; shift ;;
+    -s|--scope)
+      if [ $# -lt 2 ]; then
+        die "flag '$1' requires a SCOPE argument; try 'flatmap --help'"
+      fi
+      scope="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown flag '$1'; try 'flatmap --help'" ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  log "missing COMMAND"
+  usage >&2
+  exit 2
+fi
+
+# Exported so a command script resolves siblings the same way flatmap did.
+FLATMAP_SCOPE="$scope"
+export FLATMAP_SCOPE
+
+command="$1"
+shift
+
+script="${FLATMAP_SCOPE}/commands/${command}"
+if [ ! -d "$FLATMAP_SCOPE" ]; then
+  die "no such scope directory '${FLATMAP_SCOPE}'; hint: set -s SCOPE or FLATMAP_SCOPE"
+fi
+if [ ! -f "$script" ]; then
+  die "unknown command '${command}': no such file '${script}'; hint: ls '${FLATMAP_SCOPE}/commands'"
+fi
+if [ ! -x "$script" ]; then
+  die "command '${command}' is not executable; hint: chmod +x '${script}'"
+fi
+
+# Map over the records on stdin, output order matches input order.
+if [ "$nul" -eq 1 ]; then
+  # A NUL stream does not run COMMAND.
+  count=0
+  if [ ! -t 0 ]; then
+    # A trailing record without a closing NUL is accepted too.
+    while IFS= read -r -d '' record || [ -n "$record" ]; do
+      count=$((count + 1))
+      printf '%s' "$record" | call_command "$@"
+    done
+  fi
+else
+  # The one record is all of stdin, passed as-is; a terminal gives an empty one.
+  count=1
+  if [ -t 0 ]; then
+    call_command "$@" < /dev/null
+  else
+    call_command "$@"
+  fi
+fi
